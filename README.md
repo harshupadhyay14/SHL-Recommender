@@ -1,66 +1,50 @@
 # SHL Assessment Recommender
 
 ## What's here
-- `app/` — FastAPI service (`main.py`), BM25 retrieval (`catalog.py`), Groq agent (`agent.py`), schemas
-- `scripts/scrape_catalog.py` — full 2-phase catalog scraper (run this to get all ~380 Individual Test Solutions)
-- `scripts/extract_from_traces.py` — pulls verified assessment data straight out of the trace tables
-- `data/catalog.json` — **dev catalog** (54 items: partial scrape + trace-verified). Replace with the real scrape before submitting.
-- `data/traces/` — your 10 conversation traces
+- `app/` — FastAPI service (`main.py`), hybrid BM25 + embedding retrieval (`catalog.py`), Groq agent (`agent.py`), schemas
+- `scripts/convert_official_catalog.py` — converts SHL's official pre-scraped catalog JSON (`data/catalog_raw.json`) into the schema this app uses
+- `data/catalog.json` — **full catalog, 377 items**, already committed and ready to use as-is. No scrape step needed at setup or deploy time.
+- `data/catalog_raw.json` — the original official catalog JSON, kept for reference
+- `data/traces/` — the 10 labeled conversation traces
 - `tests/replay_harness.py` — replays each trace's real user turns against the live agent, computes Recall@10
+- `scripts/check_retrieval.py` — offline check (no LLM calls) of what fraction of gold-standard assessments are reachable by retrieval alone
 
 ## 1. Setup
-```bash
+```powershell
 cd shl-recommender
-python3 -m venv venv && source venv/bin/activate
+python -m venv .venv
+.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-cp .env.example .env   # then edit .env and add your real GROQ_API_KEY
-export $(cat .env | xargs)   # or just export GROQ_API_KEY=... directly
+# create a .env file with:
+#   GROQ_API_KEY=your_key_here
 ```
 
-## 2. Get the full catalog (do this before final submission)
-```bash
-python scripts/scrape_catalog.py --workers 8
+## 2. Run the server locally
+```powershell
+uvicorn app.main:app --reload --port 8000
 ```
-This overwrites `data/catalog.json` with the full ~380-item Individual Test Solutions catalog,
-including descriptions/job levels/duration scraped from each detail page. Takes a few minutes.
-The dev catalog checked in now (54 items) is enough to test the pipeline end-to-end but will hurt
-your Recall@10 score if you deploy with it as-is — SHL's holdout traces will ask about assessments
-outside this small set.
+```powershell
+python -c "import requests; r = requests.get('http://localhost:8000/health'); print(r.status_code, r.text)"
+python -c "import requests; r = requests.post('http://localhost:8000/chat', json={'messages':[{'role':'user','content':'Hiring a Java developer'}]}); print(r.status_code, r.text)"
+```
+(Prefer the Python `requests` snippets above over `curl` on Windows/PowerShell — PowerShell's quoting rules mangle escaped JSON in `curl.exe -d "..."` calls.)
 
-## 3. Run the replay harness (this is the important one — send me the output)
-```bash
+## 3. Run the replay harness
+```powershell
 python tests/replay_harness.py
 ```
-This prints per-trace turn counts, gold shortlist size, predicted shortlist size, and Recall@10,
-plus a mean across all 10 traces. **Paste that output back to me** (not your API key) so I can see
-where retrieval or the agent prompt is under/over-shooting and iterate.
+Prints per-trace turn counts, gold shortlist size, predicted shortlist size, and Recall@10, plus a mean across all 10 traces. Paced with a delay between calls to respect Groq's free-tier rate limits (12K TPM / 100K TPD).
 
-## 4. Run the server locally
-```bash
-uvicorn app.main:app --reload --port 8000
-curl http://localhost:8000/health
-curl -X POST http://localhost:8000/chat -H "Content-Type: application/json" \
-  -d '{"messages":[{"role":"user","content":"Hiring a Java developer who works with stakeholders"}]}'
-```
-
-## 5. Deploy to Render
-- Push this repo to GitHub.
-- New Web Service on Render, connect the repo. `render.yaml` already defines the build/start commands
-  (build step runs the full scraper automatically) — Render should pick it up via "Infrastructure as Code" or
-  you can set Build/Start commands manually to match render.yaml.
+## 4. Deploy to Render
+- Push this repo to GitHub, connect it as a new Web Service on Render.
+- `render.yaml` defines the build/start commands — build is just `pip install -r requirements.txt` (the catalog is already committed, no scrape needed at build time).
 - Add `GROQ_API_KEY` as a secret env var in the Render dashboard (never commit it).
-- First `/health` call after a cold start can take up to 2 minutes (per the assignment spec) — Render free tier sleeps idle services.
+- First request after a cold start may take longer than usual — Render's free tier sleeps idle services, and the embedding model + index also build in-memory on first load.
 
-## Design notes (for the approach doc)
-- **Retrieval**: BM25 over name + test-type label + description + job levels. Chosen over embeddings because
-  the catalog is a few hundred short structured records with domain-specific vocabulary (product names, acronyms
-  like "SQL", "AWS") where lexical match outperforms semantic embeddings for a corpus this size and structure,
-  and it's zero-cost/zero-latency vs. calling an embeddings API.
-- **Agent**: single Groq call per turn (JSON mode) rather than a multi-hop tool-calling loop — this is a
-  single-hop retrieval task, and one grounded call comfortably fits the 30s timeout and is easier to keep
-  from hallucinating than an open-ended agentic loop.
-- **Hallucination guard**: every recommendation URL is checked against the actual catalog after the LLM
-  responds; anything not in the catalog is silently dropped rather than trusted. This is enforced in code,
-  not just prompted for.
-- **Stateless design**: full history is re-sent and re-parsed each call; there's no server-side session state,
-  so a restart or load-balanced instance can't lose context.
+## Design notes (see approach doc for full detail)
+- **Retrieval**: hybrid BM25 (lexical) + local sentence-embedding cosine similarity (`all-MiniLM-L6-v2`, runs offline, no API cost), combined via Reciprocal Rank Fusion. BM25 alone was replaced with this hybrid approach because pure lexical matching missed assessments that are semantically implied rather than named (e.g. "containerization skills" → Docker).
+- **Agent**: single Groq call per turn (JSON mode), not a multi-hop tool-calling loop — this is a single-hop retrieval task, and one grounded call comfortably fits the 30s timeout and is easier to keep from hallucinating than an open-ended agentic loop.
+- **Hallucination guard**: every recommendation URL is checked against the actual catalog after the LLM responds; anything not in the catalog is silently dropped. Enforced in code, not just prompted for.
+- **Error handling**: the Groq call is wrapped with a timeout and exception handling, so a rate limit or transient failure degrades to a valid response instead of a raw 500.
+- **Stateless design**: full history is re-sent and re-parsed each call; there's no server-side session state.
+- **Known limitation**: retrieval is grounded in the user's literal words, so recommendations that depend on a domain inference not yet stated in the conversation (e.g. inferring "dependability/safety" relevance from "handles patient records") can be missed. See approach doc for detail.
