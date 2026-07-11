@@ -76,7 +76,12 @@ class Catalog:
         ]
         return " ".join(p for p in parts if p)
 
-    def search(self, query: str, top_k: int = 40) -> List[Dict[str, Any]]:
+    def search(self, query: str, top_k: int = 18) -> List[Dict[str, Any]]:
+        # Default lowered 40->18 to match agent.py's call site -- see the
+        # comment there for why (Groq free-tier TPM budget). Callers that
+        # need the old wider pool (e.g. offline retrieval-reachability
+        # checks that don't cost any LLM tokens) can still pass top_k=40
+        # explicitly.
         if not self.items:
             return []
         if not query.strip():

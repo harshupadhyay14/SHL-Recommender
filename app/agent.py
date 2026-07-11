@@ -17,18 +17,20 @@ assessments in a catalog" isn't a research task), and a single grounded call
 is both faster and easier to keep from going off the rails than letting the
 model decide when to retrieve.
 """
+from dotenv import load_dotenv
+load_dotenv()
+
 import json
 import os
+import sys
 from typing import List, Dict, Any
 
 from groq import Groq
-from dotenv import load_dotenv
-load_dotenv()
 
 from app.catalog import catalog
 from app.schemas import Message, ChatResponse, Recommendation
 
-MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 MAX_TURNS = 8
 
 _client = None
@@ -102,7 +104,11 @@ def _format_candidates(items: List[Dict[str, Any]]) -> str:
     lines = []
     for item in items:
         desc = (item.get("description") or "").strip()
-        desc = (desc[:200] + "...") if len(desc) > 200 else desc
+        # Trimmed from 200->120 chars: with ~2 retrieval queries x top_k
+        # candidates, description text was the single biggest contributor
+        # to per-call token size and was pushing calls close to/over the
+        # Groq free-tier 12K TPM budget (see catalog.py top_k change too).
+        desc = (desc[:120] + "...") if len(desc) > 120 else desc
         lines.append(
             f"- name: {item['name']} | url: {item['url']} | test_type: {item.get('test_type', '')}"
             + (f" | description: {desc}" if desc else "")
@@ -123,7 +129,16 @@ def run_chat(messages: List[Message]) -> ChatResponse:
     candidates: List[Dict[str, Any]] = []
     seen = set()
     for q in queries:
-        for item in catalog.search(q, top_k=40):
+        # Reduced from 40->18: two queries x 40 candidates (up to ~80 lines,
+        # each with a name/url/test_type/description) was routinely pushing
+        # a single call to several thousand tokens once the system prompt
+        # and full conversation history were added, close to/over Groq's
+        # free-tier 12K TPM budget. check_retrieval.py showed 76.7% gold-
+        # item reachability at top_k=40; rerun it after this change to
+        # confirm reachability doesn't regress meaningfully at top_k=18 --
+        # the default-candidate and exact-name-mention injection below
+        # still runs on top of this and isn't affected by top_k.
+        for item in catalog.search(q, top_k=18):
             if item["url"] not in seen:
                 candidates.append(item)
                 seen.add(item["url"])
@@ -156,6 +171,11 @@ def run_chat(messages: List[Message]) -> ChatResponse:
         # degrade to a valid, schema-conforming response rather than crash
         # the request with an unhandled 500 -- the evaluator should never
         # see a raw traceback regardless of what Groq does on their end.
+        # IMPORTANT: still log the real exception to stderr first. The
+        # earlier all-zero Recall@10 runs were undiagnosable specifically
+        # because this block swallowed the exception with no trace --
+        # don't let that happen silently again.
+        print(f"[agent] Groq call failed: {type(e).__name__}: {e}", file=sys.stderr)
         return ChatResponse(
             reply=(
                 "I'm having trouble reaching the recommendation engine right now "

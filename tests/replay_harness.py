@@ -11,12 +11,25 @@ Usage:
     export GROQ_API_KEY=...
     python tests/replay_harness.py
 """
-import time
-SECONDS_BETWEEN_CALLS = 3
 import glob
 import re
 import sys
+import time
 from pathlib import Path
+
+# Raised from 3->20. Each call is far larger than it looks: system prompt
+# (~700 tok) + up to ~2 x top_k candidate lines with descriptions + the
+# ENTIRE conversation history so far (re-sent every turn, since agent.py is
+# stateless) + max_tokens=1024 reserved for the reply. On a long trace
+# (e.g. C9.md's 7 turns) later calls are meaningfully bigger than earlier
+# ones. Against Groq's free-tier 12K TPM budget, 3s between calls isn't
+# enough headroom to avoid stacking into the same per-minute window --
+# that's almost certainly what caused every trace to hit the except-block
+# fallback and return recommendations=[] on both prior full-harness runs.
+# If you still see failures at 20s, check the new stderr logging in
+# agent.py's except block for the real exception (rate limit vs. something
+# else) before raising this further.
+SECONDS_BETWEEN_CALLS = 20
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
